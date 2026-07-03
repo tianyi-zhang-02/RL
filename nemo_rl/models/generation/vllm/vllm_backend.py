@@ -118,7 +118,6 @@ class _SparseDeltaTargetPlan:
 class VllmInternalWorkerExtension:
     state_dict_info: dict[str, Any] | None = None
     _direct_sparse_delta_targets: dict[str, torch.Tensor] | None = None
-    _direct_sparse_delta_modules: dict[str, torch.nn.Module] | None = None
     _direct_sparse_delta_plan_cache: dict[str, _SparseDeltaTargetPlan | None] | None = (
         None
     )
@@ -184,7 +183,6 @@ class VllmInternalWorkerExtension:
         """
         self.state_dict_info = state_dict_info  # pyrefly: ignore[implicitly-defined-attribute]  This class does not define __init__ so assignments like this should be ignored
         self._direct_sparse_delta_targets = None
-        self._direct_sparse_delta_modules = None
         self._direct_sparse_delta_plan_cache = None
 
     def _process_weights_after_loading(
@@ -385,16 +383,32 @@ class VllmInternalWorkerExtension:
         metadata: list[dict[str, Any]],
     ) -> None:
         """Apply sparse deltas directly after validating every target plan."""
-        if self._direct_sparse_delta_uses_loader_transform():
+        architectures = self.model_runner.vllm_config.model_config.architectures
+        from nemo_rl.models.generation.vllm.quantization import fp8
+
+        if {"GptOssForCausalLM", "Gemma3ForConditionalGeneration"} & set(
+            architectures
+        ) or fp8.is_fp8_model(self.model_runner.vllm_config):
             raise RuntimeError(
                 "Direct sparse delta refit does not support transformed or FP8 weights."
             )
 
-        targets = self._direct_sparse_delta_target_map()
+        if self._direct_sparse_delta_targets is None:
+            model = self.model_runner.model
+            self._direct_sparse_delta_targets = dict(model.named_parameters()) | dict(
+                model.named_buffers()
+            )
+        targets = self._direct_sparse_delta_targets
         raw_locations, raw_values = payload_tensors
+        plan_cache = self._direct_sparse_delta_plan_cache
+        if plan_cache is None:
+            plan_cache = self._direct_sparse_delta_plan_cache = {}
         plans = []
         for item in metadata:
-            plan = self._cached_direct_sparse_delta_target_plan(item, targets)
+            name = str(item["name"])
+            if name not in plan_cache:
+                plan_cache[name] = self._direct_sparse_delta_target_plan(item, targets)
+            plan = plan_cache[name]
             if plan is None:
                 raise RuntimeError(
                     f"No direct sparse delta target plan for {item['name']!r}."
@@ -441,48 +455,15 @@ class VllmInternalWorkerExtension:
                     else:
                         target_flat.index_add_(0, locations, values)
 
-    def _direct_sparse_delta_target_map(self) -> dict[str, torch.Tensor]:
-        if self._direct_sparse_delta_targets is None:
-            self._direct_sparse_delta_targets = dict(
-                self.model_runner.model.named_parameters()
-            )
-            self._direct_sparse_delta_targets.update(
-                self.model_runner.model.named_buffers()
-            )
-        return self._direct_sparse_delta_targets
-
-    def _direct_sparse_delta_named_module(
+    def _direct_sparse_delta_module(
         self,
+        target: torch.Tensor,
         module_name: str,
-    ) -> torch.nn.Module | None:
-        if self._direct_sparse_delta_modules is None:
-            self._direct_sparse_delta_modules = dict(
-                self.model_runner.model.named_modules()
-            )
-        return self._direct_sparse_delta_modules.get(module_name)
-
-    def _direct_sparse_delta_uses_loader_transform(self) -> bool:
-        architectures = self.model_runner.vllm_config.model_config.architectures
-        if {"GptOssForCausalLM", "Gemma3ForConditionalGeneration"} & set(architectures):
-            return True
-
-        from nemo_rl.models.generation.vllm.quantization import fp8
-
-        return fp8.is_fp8_model(self.model_runner.vllm_config)
-
-    def _cached_direct_sparse_delta_target_plan(
-        self,
-        item: dict[str, Any],
-        targets: dict[str, torch.Tensor],
-    ) -> _SparseDeltaTargetPlan | None:
-        name = str(item["name"])
-        if self._direct_sparse_delta_plan_cache is None:
-            self._direct_sparse_delta_plan_cache = {}
-        if name not in self._direct_sparse_delta_plan_cache:
-            self._direct_sparse_delta_plan_cache[name] = (
-                self._direct_sparse_delta_target_plan(item, targets)
-            )
-        return self._direct_sparse_delta_plan_cache[name]
+    ) -> Any:
+        loader = getattr(target, "weight_loader", None)
+        return getattr(
+            loader, "__self__", None
+        ) or self.model_runner.model.get_submodule(module_name)
 
     def _direct_sparse_delta_target_plan(
         self,
@@ -492,8 +473,9 @@ class VllmInternalWorkerExtension:
         name = str(item["name"])
         if name.startswith("mtp."):
             return _SparseDeltaTargetPlan(target=None)
-        target_name = self._map_direct_sparse_delta_name(name)
-        if target_name is None:
+        mapper = getattr(self.model_runner.model, "hf_to_vllm_mapper", None)
+        target_name = cast(Any, mapper)._map_name(name) if mapper is not None else name
+        if target_name is None or target_name.startswith("draft."):
             return None
         if ".mixer." in target_name:
             mamba_plan = self._direct_sparse_delta_mamba2_plan(
@@ -529,11 +511,7 @@ class VllmInternalWorkerExtension:
         if target is None:
             return None
         output_dim = int(cast(Any, target).output_dim) % target.ndim
-        module = cast(
-            Any,
-            getattr(getattr(target, "weight_loader", None), "__self__", None)
-            or self._direct_sparse_delta_named_module(packed_name.rsplit(".", 1)[0]),
-        )
+        module = self._direct_sparse_delta_module(target, packed_name.rsplit(".", 1)[0])
         shard_offset = int(module._get_shard_offset_mapping(shard_id))
         shard_size = int(module._get_shard_size_mapping(shard_id))
         shard_rank = int(module.tp_rank)
@@ -581,7 +559,7 @@ class VllmInternalWorkerExtension:
             return None
 
         mixer_name = target_name.split(".mixer.", 1)[0] + ".mixer"
-        attrs = cast(Any, self._direct_sparse_delta_named_module(mixer_name))
+        attrs = cast(Any, self.model_runner.model.get_submodule(mixer_name))
         tp_size = int(attrs.tp_size)
         if tp_size <= 1:
             return None
@@ -597,7 +575,7 @@ class VllmInternalWorkerExtension:
         if remainder or group_size <= 0 or extra_group_size < 0:
             return None
         tp_rank = int(
-            getattr(target, "tp_rank", self._direct_sparse_delta_tp_rank(tp_size))
+            getattr(target, "tp_rank", int(getattr(self, "rank", 0)) % tp_size)
         )
         intermediate = (intermediate_size, 0, False)
         group = (groups_ssm_state_size, extra_group_size, extra_group_size > 0)
@@ -658,10 +636,8 @@ class VllmInternalWorkerExtension:
         target = targets.get(packed_name)
         if target is None:
             return None
-        module_attrs = cast(
-            Any,
-            getattr(getattr(target, "weight_loader", None), "__self__", None)
-            or self._direct_sparse_delta_named_module(packed_name.rsplit(".", 1)[0]),
+        module_attrs = self._direct_sparse_delta_module(
+            target, packed_name.rsplit(".", 1)[0]
         )
         if shard_id == "w3" and not module_attrs.moe_config.is_act_and_mul:
             shard_id = "w1"
@@ -796,7 +772,7 @@ class VllmInternalWorkerExtension:
             if source_shape[shard_dim] > shard_size * tp_size:
                 continue
             tp_rank = int(
-                getattr(target, "tp_rank", self._direct_sparse_delta_tp_rank(tp_size))
+                getattr(target, "tp_rank", int(getattr(self, "rank", 0)) % tp_size)
             )
             plan = self._make_sparse_delta_target_plan(
                 target=target,
@@ -885,22 +861,6 @@ class VllmInternalWorkerExtension:
                 coord = coord - plan.shard_start
             local_locations.add_(coord * target_stride)
         return local_locations, selected_values
-
-    def _direct_sparse_delta_tp_rank(self, tp_size: int) -> int:
-        if tp_size <= 1:
-            return 0
-        rank = int(getattr(self, "rank", 0))
-        return rank % tp_size
-
-    def _map_direct_sparse_delta_name(self, name: str) -> str | None:
-        mapper = getattr(self.model_runner.model, "hf_to_vllm_mapper", None)
-        if mapper is not None:
-            name = cast(Any, mapper)._map_name(name)
-            if name is None:
-                return None
-        if name.startswith("draft."):
-            return None
-        return name
 
     @wrap_with_nvtx_name("vllm_internal_worker_extension/update_weights_via_ipc_zmq")
     def update_weights_via_ipc_zmq(self) -> bool:
@@ -1024,17 +984,13 @@ class VllmInternalWorkerExtension:
     def update_weights_from_serialized_sparse_payload(
         self,
         serialized_payload: bytes,
-        synchronize: bool = True,
     ) -> dict[str, Any]:
-        """Apply one serialized sparse-delta payload received from S3."""
-        return self._load_and_apply_sparse_payload(
-            io.BytesIO(serialized_payload), synchronize
-        )
+        """Apply one serialized sparse-delta payload."""
+        return self._load_and_apply_sparse_payload(io.BytesIO(serialized_payload))
 
     def _load_and_apply_sparse_payload(
         self,
         source: str | io.BytesIO,
-        synchronize: bool,
     ) -> dict[str, Any]:
         started = time.perf_counter()
         payload = cast(
@@ -1046,7 +1002,7 @@ class VllmInternalWorkerExtension:
             ),
         )
         deserialize_s = time.perf_counter() - started
-        result = self._apply_sparse_request(payload, synchronize=synchronize)
+        result = self._apply_sparse_request(payload)
         result["receiver_deserialize_s"] = deserialize_s
         result["receiver_total_s"] = time.perf_counter() - started
         return result
@@ -1057,20 +1013,15 @@ class VllmInternalWorkerExtension:
     def update_weights_from_sparse_payload_files(
         self,
         *payload_paths: str,
-        synchronize: bool = True,
     ) -> dict[str, Any]:
-        """Apply sparse payloads in FIFO order with one final sync."""
-        if not payload_paths:
-            raise ValueError("A sparse refit batch must contain at least one payload.")
+        """Apply sparse payloads in FIFO order."""
         started = time.perf_counter()
         deserialize_s = 0.0
         sparse_apply_s = 0.0
         for path in payload_paths:
-            result = self._load_and_apply_sparse_payload(path, synchronize=False)
+            result = self._load_and_apply_sparse_payload(path)
             deserialize_s += float(result["receiver_deserialize_s"])
             sparse_apply_s += float(result["receiver_sparse_apply_s"])
-        if synchronize and torch.cuda.is_available():
-            torch.cuda.synchronize(self.device)
         return {
             "ok": True,
             "receiver_deserialize_s": deserialize_s,
@@ -1081,8 +1032,6 @@ class VllmInternalWorkerExtension:
     def _apply_sparse_request(
         self,
         payload: sparse_codec.TensorPayload,
-        *,
-        synchronize: bool,
     ) -> dict[str, Any]:
         locations, values, metadata = payload
 
@@ -1090,18 +1039,15 @@ class VllmInternalWorkerExtension:
         self._apply_sparse_weight_deltas((locations, values), metadata)
         sparse_apply_s = time.perf_counter() - sparse_started
 
-        if synchronize and torch.cuda.is_available():
-            torch.cuda.synchronize(self.device)
         return {
             "ok": True,
             "receiver_sparse_apply_s": sparse_apply_s,
         }
 
-    def synchronize_device(self) -> dict[str, Any]:
+    def synchronize_device(self) -> None:
         """Synchronize this vLLM worker's CUDA device after deferred refit applies."""
         if torch.cuda.is_available():
             torch.cuda.synchronize(self.device)
-        return {"ok": True}
 
     def cleanup(self) -> None:
         """Shutdown and cleanup resources."""

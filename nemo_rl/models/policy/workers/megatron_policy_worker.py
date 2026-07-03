@@ -93,11 +93,12 @@ from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.nvml import log_gpu_memory_diagnostics
 from nemo_rl.utils.packed_tensor import packed_broadcast_producer
 from nemo_rl.utils.r3_trace import maybe_r3_trace_stage
-from nemo_rl.utils.weight_transfer_s3_manifest import (
+from nemo_rl.utils.weight_transfer_remote_sparse import (
     init_sparse_delta_baseline_from_iterator,
     stream_sparse_delta_payloads_via_s3_manifest,
 )
 from nemo_rl.utils.weight_transfer_sparse_codec import DeltaCompressionTracker
+from nemo_rl.utils.weight_transfer_zmq import stream_sparse_delta_payloads_via_zmq
 
 TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
 
@@ -345,11 +346,9 @@ class MegatronPolicyWorkerImpl(
         self.is_generation_colocated = runtime_config.is_generation_colocated
         self.final_padded_vocab_size = runtime_config.final_padded_vocab_size
         self.sampling_params = runtime_config.sampling_params
-        delta_config = self.cfg.get("generation", {}).get("delta_compression")
+        delta_config = self.cfg["generation"].get("delta_compression")
         self.delta_weight_transfer_tracker = (
-            DeltaCompressionTracker(delta_config)
-            if delta_config and delta_config["enabled"]
-            else None
+            DeltaCompressionTracker(delta_config) if delta_config else None
         )
 
         self.defer_fp32_logits = self.cfg["megatron_cfg"].get(
@@ -1227,38 +1226,61 @@ class MegatronPolicyWorkerImpl(
     def init_remote_sparse_delta_baseline(
         self,
         *,
-        shard_rank: int = 0,
-        shard_count: int = 1,
+        shard_rank: int,
+        shard_count: int,
+        transport: str,
     ) -> None:
-        """Initialize the source-side baseline for remote sparse S3 refit."""
+        """Initialize the source-side baseline for remote sparse refit."""
+        tracker = self.delta_weight_transfer_tracker
+        assert tracker is not None
         init_sparse_delta_baseline_from_iterator(
             self._iter_params_with_optional_kv_scales(),
-            delta_tracker=self.delta_weight_transfer_tracker,
+            delta_tracker=tracker,
             shard_rank=shard_rank,
             shard_count=shard_count,
+            transport=transport,
         )
 
     @torch.no_grad()
-    @wrap_with_nvtx_name("megatron_policy_worker/stream_sparse_weights_via_s3_manifest")
-    def stream_sparse_weights_via_s3_manifest(
+    @wrap_with_nvtx_name("megatron_policy_worker/stream_remote_sparse_weights")
+    def stream_remote_sparse_weights(
         self,
-        refit_urls: list[str],
+        transport: str,
+        targets: list[str],
         *,
-        api_key_env_var: Optional[str] = None,
-        timeout_s: float = 600.0,
-        shard_rank: int = 0,
-        shard_count: int = 1,
-    ) -> dict[str, Any]:
-        """Upload vLLM refit payloads to S3 and post receiver manifests."""
-        return stream_sparse_delta_payloads_via_s3_manifest(
+        transfer_id: str,
+        api_key_env_var: Optional[str],
+        timeout_s: float,
+        shard_rank: int,
+        shard_count: int,
+    ) -> int:
+        """Stream compressed sparse deltas through the selected value plane."""
+        tracker = self.delta_weight_transfer_tracker
+        assert tracker is not None
+        streamer = {
+            "s3": stream_sparse_delta_payloads_via_s3_manifest,
+            "zmq": stream_sparse_delta_payloads_via_zmq,
+        }.get(transport)
+        if streamer is None:
+            raise ValueError(
+                f"Unsupported remote sparse refit transport {transport!r}."
+            )
+        return streamer(
             self._iter_params_with_optional_kv_scales(),
-            delta_tracker=self.delta_weight_transfer_tracker,
-            refit_urls=refit_urls,
+            delta_tracker=tracker,
+            refit_targets=targets,
+            transfer_id=transfer_id,
             api_key_env_var=api_key_env_var,
             timeout_s=timeout_s,
             shard_rank=shard_rank,
             shard_count=shard_count,
         )
+
+    def _get_refit_conversion_tasks(self) -> list[Any]:
+        if self.refit_conversion_tasks is None:
+            tasks = self.megatron_bridge.get_conversion_tasks([self.model])
+            self.refit_conversion_tasks = [task for task in tasks if task is not None]
+        return self.refit_conversion_tasks
 
     def finish_remote_sparse_delta_sync(self, *, succeeded: bool) -> None:
         tracker = self.delta_weight_transfer_tracker
@@ -1283,11 +1305,7 @@ class MegatronPolicyWorkerImpl(
         Returns:
             List of (parameter_name, size_in_bytes) tuples.
         """
-        self.refit_conversion_tasks = [
-            task
-            for task in self.megatron_bridge.get_conversion_tasks([self.model])
-            if task is not None
-        ]
+        conversion_tasks = self._get_refit_conversion_tasks()
         param_info = []
 
         def calculate_size_in_bytes(param, tp_size, ep_size):
@@ -1311,7 +1329,7 @@ class MegatronPolicyWorkerImpl(
             # Broadcast size_in_bytes across pipeline parallel ranks
             return broadcast_obj_from_pp_rank(size_in_bytes)
 
-        for task in self.refit_conversion_tasks:
+        for task in conversion_tasks:
             param_info.append(
                 (
                     task.param_name,
@@ -1340,7 +1358,7 @@ class MegatronPolicyWorkerImpl(
         base_iter = self.megatron_bridge.export_hf_weights(
             [self.model],
             show_progress=False,
-            conversion_tasks=self.refit_conversion_tasks,  # used for metadata caching
+            conversion_tasks=self._get_refit_conversion_tasks(),
         )
 
         # Yield the original parameters first.

@@ -18,12 +18,13 @@ import os
 import sys
 import threading
 import types
-from collections import deque
-from concurrent.futures import ThreadPoolExecutor
+from collections.abc import Iterator
+from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import contextmanager
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, call
 
 import pytest
 import ray
@@ -165,41 +166,50 @@ def test_resolve_enable_prefix_caching_uses_cuda_capability_for_auto(monkeypatch
     assert _resolve_enable_prefix_caching({}) is False
 
 
-def test_sparse_refit_queue_batches_payloads_in_fifo_order() -> None:
+@contextmanager
+def _sparse_refit_worker(
+    *, batch_size: int = 2, futures: list[Future[dict[str, Any]]] | None = None
+) -> Iterator[BaseVllmGenerationWorker]:
     worker = BaseVllmGenerationWorker.__new__(BaseVllmGenerationWorker)
     worker._refit_apply_queue_lock = threading.Lock()
     worker._refit_apply_executor = ThreadPoolExecutor(max_workers=1)
-    worker._refit_apply_futures = deque()
+    worker._refit_apply_futures = list(futures or [])
     worker._refit_apply_pending_payloads = []
-    worker._refit_apply_payload_count = 0
-    worker._refit_apply_batch_count = 0
+    worker._refit_seen_payloads = {}
     worker._refit_apply_queue_depth = 2
-    worker._refit_apply_batch_size = 3
+    worker._refit_apply_batch_size = batch_size
     worker.llm = MagicMock()
-    applied: list[tuple[tuple[bytes, ...], bool]] = []
+    try:
+        yield worker
+    finally:
+        worker._refit_apply_executor.shutdown(wait=True)
 
-    def apply(payloads: tuple[bytes, ...], synchronize: bool) -> dict[str, Any]:
-        applied.append((payloads, synchronize))
+
+def test_sparse_refit_queue_batches_payloads_in_fifo_order() -> None:
+    applied: list[tuple[bytes, ...]] = []
+
+    def apply(payloads: tuple[bytes, ...]) -> dict[str, Any]:
+        applied.append(payloads)
         return {
             "ok": True,
             "payloads": len(payloads),
             "receiver_total_s": float(len(payloads)),
         }
 
-    worker.update_weights_from_serialized_sparse_payloads = apply
-    try:
+    with _sparse_refit_worker(batch_size=3) as worker:
+        worker.update_weights_from_serialized_sparse_payloads = apply
         responses = [
-            worker._enqueue_sparse_payload_apply(payload)
-            for payload in (b"0", b"1", b"2", b"3", b"4")
+            worker._enqueue_sparse_payload_apply(
+                payload, ("transfer", 0, index), str(index)
+            )
+            for index, payload in enumerate((b"0", b"1", b"2", b"3", b"4"))
         ]
         response = worker._flush_queued_sparse_payloads()
         responses.append(response)
-    finally:
-        worker._refit_apply_executor.shutdown(wait=True)
 
     assert applied == [
-        ((b"0", b"1", b"2"), False),
-        ((b"3", b"4"), False),
+        (b"0", b"1", b"2"),
+        (b"3", b"4"),
     ]
     assert response["payloads"] == 5
     assert response["batches"] == 2
@@ -207,14 +217,43 @@ def test_sparse_refit_queue_batches_payloads_in_fifo_order() -> None:
     worker.llm.collective_rpc.assert_called_once_with("synchronize_device", args=())
 
 
+def test_sparse_refit_queue_deduplicates_transactional_payloads() -> None:
+    key = ("transfer", 0, 1)
+    with _sparse_refit_worker() as worker:
+        worker.update_weights_from_serialized_sparse_payloads = MagicMock(
+            return_value={"ok": True, "payloads": 1}
+        )
+        assert worker._enqueue_sparse_payload_apply(b"payload", key, "checksum")["ok"]
+        duplicate = worker._enqueue_sparse_payload_apply(b"payload", key, "checksum")
+        assert duplicate == {"ok": True, "payloads": 0, "duplicate": True}
+        with pytest.raises(ValueError, match="reused with different data"):
+            worker._enqueue_sparse_payload_apply(b"other", key, "different")
+        response = worker._flush_queued_sparse_payloads()
+
+    assert response["payloads"] == 1
+    assert worker._refit_seen_payloads == {}
+
+
+def test_sparse_refit_queue_does_not_deduplicate_failed_enqueue() -> None:
+    failed = Future()
+    failed.set_exception(RuntimeError("prior apply failed"))
+    with _sparse_refit_worker(futures=[failed]) as worker:
+        with pytest.raises(RuntimeError, match="prior apply failed"):
+            worker._enqueue_sparse_payload_apply(
+                b"payload", ("transfer", 0, 1), "checksum"
+            )
+
+    assert worker._refit_seen_payloads == {}
+    assert worker._refit_apply_pending_payloads == []
+
+
 def test_sparse_refit_batch_uses_one_collective_rpc(tmp_path: Path) -> None:
     worker = VllmGenerationWorkerImpl.__new__(VllmGenerationWorkerImpl)
     staged_payloads: list[bytes] = []
 
-    def collective_rpc(method, args, kwargs):
+    def collective_rpc(method, args):
         assert method == "update_weights_from_sparse_payload_files"
         staged_payloads.extend(Path(path).read_bytes() for path in args)
-        assert kwargs == {"synchronize": False}
         return [{"ok": True, "receiver_total_s": 1.0}]
 
     worker.llm = MagicMock(collective_rpc=MagicMock(side_effect=collective_rpc))
@@ -222,9 +261,7 @@ def test_sparse_refit_batch_uses_one_collective_rpc(tmp_path: Path) -> None:
     worker._refit_batch_staging_dir = str(tmp_path)
     payloads = (b"0", b"1", b"2")
 
-    response = worker.update_weights_from_serialized_sparse_payloads(
-        payloads, synchronize=False
-    )
+    response = worker.update_weights_from_serialized_sparse_payloads(payloads)
 
     assert staged_payloads == list(payloads)
     assert not list(tmp_path.iterdir())
@@ -241,17 +278,9 @@ def test_sparse_refit_batch_falls_back_across_nodes() -> None:
 
     response = worker.update_weights_from_serialized_sparse_payloads((b"0", b"1", b"2"))
 
-    calls = worker.llm.collective_rpc.call_args_list
-    assert [call.args[0] for call in calls] == [
-        "update_weights_from_serialized_sparse_payload",
-        "update_weights_from_serialized_sparse_payload",
-        "update_weights_from_serialized_sparse_payload",
-        "synchronize_device",
-    ]
-    assert [call.kwargs["args"] for call in calls[:3]] == [
-        (b"0", False),
-        (b"1", False),
-        (b"2", False),
+    assert worker.llm.collective_rpc.call_args_list == [
+        call("update_weights_from_serialized_sparse_payload", args=(payload,))
+        for payload in (b"0", b"1", b"2")
     ]
     assert response == {"ok": True, "receiver_total_s": 3.0, "payloads": 3}
 
@@ -544,9 +573,10 @@ def test_configure_generation_config_uses_real_startup_weights_without_draft_ref
     assert configured["vllm_cfg"]["load_format"] == "auto"
 
 
-def test_configure_generation_config_uses_real_s3_delta_baseline():
+@pytest.mark.parametrize("transport", ["vllm_s3_sparse", "vllm_zmq_sparse"])
+def test_configure_generation_config_uses_real_delta_baseline(transport: str):
     vllm_config = deepcopy(basic_vllm_test_config)
-    vllm_config["refit_transport"] = "vllm_s3_sparse"
+    vllm_config["refit_transport"] = transport
 
     configured = configure_generation_config(
         vllm_config, MagicMock(pad_token_id=0, eos_token_id=1)

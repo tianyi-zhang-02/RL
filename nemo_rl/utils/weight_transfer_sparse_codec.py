@@ -122,19 +122,20 @@ class DeltaCompressionTracker:
         self.sparse_bucket_size_bytes = int(config["sparse_bucket_size_bytes"])
         if self.sparse_bucket_size_bytes < 1:
             raise ValueError("delta_compression.sparse_bucket_size_bytes must be >= 1")
-        dtype_name = {"bf16": "bfloat16", "fp16": "float16", "fp32": "float32"}.get(
-            str(config["dtype"]).lower(), str(config["dtype"]).lower()
-        )
-        self.delta_dtype: torch.dtype = getattr(torch, dtype_name)
+        self.delta_dtype = {
+            "bf16": torch.bfloat16,
+            "bfloat16": torch.bfloat16,
+            "fp16": torch.float16,
+            "float16": torch.float16,
+            "fp32": torch.float32,
+            "float32": torch.float32,
+        }[str(config["dtype"]).lower()]
         self.baseline_in_memory = os.getenv("NRL_REFIT_BASELINE_IN_MEMORY") == "1"
-        self.baseline_mmap_dir = config.get("baseline_mmap_dir") or os.getenv(
-            "NRL_REFIT_BASELINE_MMAP_DIR"
-        )
+        self.baseline_mmap_dir = os.getenv("NRL_REFIT_BASELINE_MMAP_DIR")
         self.baseline: dict[str, torch.Tensor] = {}
         self._pending_updates: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
         self._pending_updates_lock = threading.Lock()
         self._baseline_commits: tuple[Any, ...] = ()
-        self._baseline_commit_lock = threading.Lock()
         self._baseline_commit_executor = ThreadPoolExecutor(
             max_workers=4, thread_name_prefix="nrl-refit-baseline"
         )
@@ -172,13 +173,12 @@ class DeltaCompressionTracker:
             pending_updates, self._pending_updates = self._pending_updates, {}
         items = list(pending_updates.items())
         workers = min(4, len(items))
-        with self._baseline_commit_lock:
-            self._baseline_commits = tuple(
-                self._baseline_commit_executor.submit(
-                    self._commit_baseline_updates, items[worker::workers]
-                )
-                for worker in range(workers)
+        self._baseline_commits = tuple(
+            self._baseline_commit_executor.submit(
+                self._commit_baseline_updates, items[worker::workers]
             )
+            for worker in range(workers)
+        )
 
     def on_sync_failed(self) -> None:
         with self._pending_updates_lock:
@@ -190,13 +190,9 @@ class DeltaCompressionTracker:
             self._baseline(name, tuple(tensor.shape), tensor.dtype).copy_(tensor)
 
     def _wait_for_baseline_commits(self) -> None:
-        with self._baseline_commit_lock:
-            commits = self._baseline_commits
-        for commit in commits:
+        for commit in self._baseline_commits:
             commit.result()
-        with self._baseline_commit_lock:
-            if self._baseline_commits == commits:
-                self._baseline_commits = ()
+        self._baseline_commits = ()
 
     def _commit_baseline_updates(
         self, updates: Iterable[tuple[str, tuple[torch.Tensor, torch.Tensor]]]
