@@ -210,7 +210,7 @@ class BaseVllmGenerationWorker:
                 _load_model() later to perform the heavy model loading. This
                 enables overlapping vLLM model loading with NeMo Gym init.
         """
-        self._refit_apply_queue_lock = threading.Lock()
+        self._refit_apply_queue_condition = threading.Condition()
         self._refit_apply_executor = ThreadPoolExecutor(max_workers=1)
         self._refit_apply_futures: list[Future[dict[str, Any]]] = []
         self._refit_apply_pending_payloads: list[bytes] = []
@@ -634,7 +634,8 @@ class BaseVllmGenerationWorker:
         checksum: str,
     ) -> dict[str, Any]:
         completed: list[Future[dict[str, Any]]] = []
-        with self._refit_apply_queue_lock:
+        submitted = None
+        with self._refit_apply_queue_condition:
             seen_checksum = self._refit_seen_payloads.get(payload_key)
             if seen_checksum is not None:
                 if seen_checksum != checksum:
@@ -642,27 +643,35 @@ class BaseVllmGenerationWorker:
                         "A sparse refit payload ID was reused with different data."
                     )
                 return {"ok": True, "payloads": 0, "duplicate": True}
-            while self._refit_apply_futures and (
-                self._refit_apply_futures[0].done()
-                or len(self._refit_apply_futures) >= self._refit_apply_queue_depth
+            while (
+                len(self._refit_apply_futures) >= self._refit_apply_queue_depth
+                and not self._refit_apply_futures[0].done()
             ):
+                self._refit_apply_queue_condition.wait()
+            while self._refit_apply_futures and self._refit_apply_futures[0].done():
                 completed.append(self._refit_apply_futures.pop(0))
             response = self._collect_refit_apply_results(completed)
             self._refit_seen_payloads[payload_key] = checksum
             self._refit_apply_pending_payloads.append(payload)
             if len(self._refit_apply_pending_payloads) == self._refit_apply_batch_size:
-                self._submit_pending_sparse_payloads()
+                submitted = self._submit_pending_sparse_payloads()
+        if submitted is not None:
+            submitted.add_done_callback(self._notify_refit_apply_waiters)
         return response
 
-    def _submit_pending_sparse_payloads(self) -> None:
+    def _submit_pending_sparse_payloads(self) -> Future[dict[str, Any]]:
         payloads = tuple(self._refit_apply_pending_payloads)
         self._refit_apply_pending_payloads.clear()
-        self._refit_apply_futures.append(
-            self._refit_apply_executor.submit(
-                self.update_weights_from_serialized_sparse_payloads,
-                payloads,
-            )
+        future = self._refit_apply_executor.submit(
+            self.update_weights_from_serialized_sparse_payloads,
+            payloads,
         )
+        self._refit_apply_futures.append(future)
+        return future
+
+    def _notify_refit_apply_waiters(self, _future: Future[dict[str, Any]]) -> None:
+        with self._refit_apply_queue_condition:
+            self._refit_apply_queue_condition.notify_all()
 
     def _collect_refit_apply_results(
         self,
@@ -688,20 +697,24 @@ class BaseVllmGenerationWorker:
 
     def _flush_queued_sparse_payloads(self) -> dict[str, Any]:
         started = time.perf_counter()
-        with self._refit_apply_queue_lock:
+        submitted = None
+        with self._refit_apply_queue_condition:
             if self._refit_apply_pending_payloads:
-                self._submit_pending_sparse_payloads()
+                submitted = self._submit_pending_sparse_payloads()
             futures = list(self._refit_apply_futures)
             self._refit_apply_futures.clear()
+            self._refit_apply_queue_condition.notify_all()
             payload_count = len(self._refit_seen_payloads)
             batch_count = (
                 payload_count + self._refit_apply_batch_size - 1
             ) // self._refit_apply_batch_size
+        if submitted is not None:
+            submitted.add_done_callback(self._notify_refit_apply_waiters)
         response = self._collect_refit_apply_results(futures)
         if futures:
             assert self.llm is not None
             self.llm.collective_rpc("synchronize_device", args=())
-        with self._refit_apply_queue_lock:
+        with self._refit_apply_queue_condition:
             self._refit_seen_payloads.clear()
         response.update(
             payloads=payload_count,

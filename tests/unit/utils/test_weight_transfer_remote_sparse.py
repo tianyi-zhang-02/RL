@@ -86,6 +86,88 @@ def test_s3_download_verifies_checksum(monkeypatch) -> None:
         download_s3_refit_payload(manifest)
 
 
+def test_sparse_export_finishes_before_blocked_transfers(monkeypatch) -> None:
+    monkeypatch.setenv("NRL_REFIT_ZMQ_ENCODE_WORKERS", "1")
+    monkeypatch.setenv("NRL_REFIT_ZMQ_EXPORT_CHUNK_BYTES", "1")
+    exported = threading.Event()
+    release_transfers = threading.Event()
+    result = []
+
+    class Tracker:
+        sparse_bucket_size_bytes = 1
+
+        @staticmethod
+        def prepare_sparse_delta_payload(chunk):
+            return chunk, torch.ones(1), [1]
+
+    def tensors():
+        for index in range(4):
+            yield f"weight-{index}", torch.ones(1)
+        exported.set()
+
+    def send_payload(_body, _payload_index):
+        assert release_transfers.wait(timeout=5.0)
+        return {"receiver": {}}
+
+    def run():
+        result.append(
+            weight_transfer_remote_sparse.stream_sparse_delta_payloads(
+                tensors(),
+                delta_tracker=Tracker(),
+                transport="zmq",
+                send_payload=send_payload,
+                transfer_workers=1,
+                shard_rank=0,
+                shard_count=1,
+            )
+        )
+
+    thread = threading.Thread(target=run)
+    thread.start()
+    try:
+        assert exported.wait(timeout=2.0)
+    finally:
+        release_transfers.set()
+        thread.join(timeout=5.0)
+
+    assert not thread.is_alive()
+    assert result == [4]
+
+
+def test_sparse_export_finishes_before_transfer_error(monkeypatch) -> None:
+    monkeypatch.setenv("NRL_REFIT_ZMQ_ENCODE_WORKERS", "1")
+    monkeypatch.setenv("NRL_REFIT_ZMQ_EXPORT_CHUNK_BYTES", "1")
+    exported = []
+
+    class Tracker:
+        sparse_bucket_size_bytes = 1
+
+        @staticmethod
+        def prepare_sparse_delta_payload(chunk):
+            return chunk, torch.ones(1), [1]
+
+    def tensors():
+        for index in range(4):
+            exported.append(index)
+            yield f"weight-{index}", torch.ones(1)
+
+    def fail_transfer(_body, _payload_index):
+        raise RuntimeError("transfer failed")
+
+    with pytest.raises(RuntimeError, match="transfer failed"):
+        weight_transfer_remote_sparse.stream_sparse_delta_payloads(
+            tensors(),
+            delta_tracker=Tracker(),
+            transport="zmq",
+            send_payload=fail_transfer,
+            transfer_workers=1,
+            shard_rank=0,
+            shard_count=1,
+        )
+
+    assert exported == list(range(4))
+
+
 def _receiver_server(received):
     class Handler(BaseHTTPRequestHandler):
         def do_POST(self):

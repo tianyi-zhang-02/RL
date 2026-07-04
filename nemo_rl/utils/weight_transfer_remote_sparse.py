@@ -294,33 +294,38 @@ def stream_sparse_delta_payloads(
         default=max(2, min(8, os.cpu_count() or 8)),
     )
     pipeline_workers = max(encode_workers, transfer_workers)
-    executor = _executor(f"refit-{transport}-pipeline", pipeline_workers)
-    encode_slots = threading.Semaphore(encode_workers)
-    transfer_slots = threading.Semaphore(transfer_workers)
+    encode_executor = _executor(f"refit-{transport}-encode", encode_workers)
+    transfer_executor = _executor(f"refit-{transport}-transfer", transfer_workers)
     export_chunk_size = sparse_export_chunk_size(delta_tracker, transport)
 
-    def process_chunk(chunk: TensorBatch, payload_index: int) -> dict[str, Any] | None:
-        with encode_slots:
-            started = time.perf_counter()
-            payload = delta_tracker.prepare_sparse_delta_payload(chunk)
-            encode_s = time.perf_counter() - started
-            if not payload[2]:
-                return None
-            started = time.perf_counter()
-            buffer = io.BytesIO()
-            torch.save(payload, buffer)
-            raw_body = buffer.getvalue()
-            serialize_s = time.perf_counter() - started
-            started = time.perf_counter()
-            body = zstd_compress(raw_body, f"NRL_REFIT_{prefix}_ZSTD_THREADS")
-            compress_s = time.perf_counter() - started
-        with transfer_slots:
-            result = send_payload(body, payload_index)
+    def encode_chunk(chunk: TensorBatch) -> tuple[bytes, dict[str, float]] | None:
+        started = time.perf_counter()
+        payload = delta_tracker.prepare_sparse_delta_payload(chunk)
+        encode_s = time.perf_counter() - started
+        if not payload[2]:
+            return None
+        started = time.perf_counter()
+        buffer = io.BytesIO()
+        torch.save(payload, buffer)
+        raw_body = buffer.getvalue()
+        serialize_s = time.perf_counter() - started
+        started = time.perf_counter()
+        body = zstd_compress(raw_body, f"NRL_REFIT_{prefix}_ZSTD_THREADS")
+        compress_s = time.perf_counter() - started
+        return body, {
+            "encode_s": encode_s,
+            "serialize_s": serialize_s,
+            "compress_s": compress_s,
+        }
+
+    def transfer_payload(
+        encoded: tuple[bytes, dict[str, float]], payload_index: int
+    ) -> dict[str, Any]:
+        body, encode_timing = encoded
+        result = send_payload(body, payload_index)
         result.update(
             body_size=len(body),
-            encode_s=encode_s,
-            serialize_s=serialize_s,
-            compress_s=compress_s,
+            **encode_timing,
         )
         return result
 
@@ -329,15 +334,24 @@ def stream_sparse_delta_payloads(
     counts = {"payloads": 0, "wire_bytes": 0}
     chunk_count = 0
     export_pull_s = 0.0
-    inflight: set[Any] = set()
-    max_inflight = pipeline_workers * 2
+    encode_inflight: dict[Any, int] = {}
+    transfer_inflight: set[Any] = set()
+    worker_errors: list[Exception] = []
+    max_encode_inflight = encode_workers * 2
 
-    def drain_completed() -> None:
-        completed, _ = wait(inflight, return_when=FIRST_COMPLETED)
+    def collect_transfers(*, block: bool) -> None:
+        if not transfer_inflight:
+            return
+        if block:
+            completed, _ = wait(transfer_inflight, return_when=FIRST_COMPLETED)
+        else:
+            completed = {future for future in transfer_inflight if future.done()}
         for future in completed:
-            inflight.remove(future)
-            result = future.result()
-            if result is None:
+            transfer_inflight.remove(future)
+            try:
+                result = future.result()
+            except Exception as error:
+                worker_errors.append(error)
                 continue
             counts["payloads"] += 1
             counts["wire_bytes"] += int(result["body_size"])
@@ -347,6 +361,25 @@ def stream_sparse_delta_payloads(
             merge_vllm_refit_receiver_timing(
                 receiver_timing, [result["receiver"]], maximum=False
             )
+
+    def drain_encodes() -> None:
+        completed, _ = wait(encode_inflight, return_when=FIRST_COMPLETED)
+        for future in completed:
+            payload_index = encode_inflight.pop(future)
+            try:
+                encoded = future.result()
+            except Exception as error:
+                worker_errors.append(error)
+                continue
+            if encoded is not None:
+                transfer_inflight.add(
+                    transfer_executor.submit(
+                        transfer_payload,
+                        encoded,
+                        payload_index,
+                    )
+                )
+        collect_transfers(block=False)
 
     payload_index = 0
     stream_start = time.perf_counter()
@@ -358,17 +391,24 @@ def stream_sparse_delta_payloads(
             export_pull_s += pull_s
             if chunk_index % shard_count != shard_rank:
                 continue
-            if len(inflight) >= max_inflight:
-                drain_completed()
-            inflight.add(executor.submit(process_chunk, chunk, payload_index))
+            if len(encode_inflight) >= max_encode_inflight:
+                drain_encodes()
+            encode_inflight[encode_executor.submit(encode_chunk, chunk)] = payload_index
             payload_index += 1
 
-        while inflight:
-            drain_completed()
+        while encode_inflight:
+            drain_encodes()
+        while transfer_inflight:
+            collect_transfers(block=True)
+        if worker_errors:
+            raise worker_errors[0]
     except Exception:
-        for future in inflight:
+        for future in (*encode_inflight, *transfer_inflight):
             future.cancel()
-        wait(inflight)
+        if encode_inflight:
+            wait(encode_inflight)
+        if transfer_inflight:
+            wait(transfer_inflight)
         raise
 
     timing = {

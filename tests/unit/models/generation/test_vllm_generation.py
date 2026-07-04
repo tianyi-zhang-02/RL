@@ -17,6 +17,7 @@ import json
 import os
 import sys
 import threading
+import time
 import types
 from collections.abc import Iterator
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -171,7 +172,7 @@ def _sparse_refit_worker(
     *, batch_size: int = 2, futures: list[Future[dict[str, Any]]] | None = None
 ) -> Iterator[BaseVllmGenerationWorker]:
     worker = BaseVllmGenerationWorker.__new__(BaseVllmGenerationWorker)
-    worker._refit_apply_queue_lock = threading.Lock()
+    worker._refit_apply_queue_condition = threading.Condition()
     worker._refit_apply_executor = ThreadPoolExecutor(max_workers=1)
     worker._refit_apply_futures = list(futures or [])
     worker._refit_apply_pending_payloads = []
@@ -179,6 +180,8 @@ def _sparse_refit_worker(
     worker._refit_apply_queue_depth = 2
     worker._refit_apply_batch_size = batch_size
     worker.llm = MagicMock()
+    for future in worker._refit_apply_futures:
+        future.add_done_callback(worker._notify_refit_apply_waiters)
     try:
         yield worker
     finally:
@@ -245,6 +248,29 @@ def test_sparse_refit_queue_does_not_deduplicate_failed_enqueue() -> None:
 
     assert worker._refit_seen_payloads == {}
     assert worker._refit_apply_pending_payloads == []
+
+
+def test_sparse_refit_queue_releases_condition_while_backpressured() -> None:
+    first: Future[dict[str, Any]] = Future()
+    second: Future[dict[str, Any]] = Future()
+    started = threading.Event()
+
+    with _sparse_refit_worker(futures=[first, second]) as worker:
+        with ThreadPoolExecutor(max_workers=1) as callers:
+            call = callers.submit(
+                lambda: (
+                    started.set(),
+                    worker._enqueue_sparse_payload_apply(
+                        b"payload", ("transfer", 0, 1), "checksum"
+                    ),
+                )[1]
+            )
+            assert started.wait(timeout=1.0)
+            time.sleep(0.05)
+            assert worker._refit_apply_queue_condition.acquire(timeout=1.0)
+            worker._refit_apply_queue_condition.release()
+            first.set_result({"ok": True, "payloads": 1})
+            assert call.result(timeout=1.0)["ok"]
 
 
 def test_sparse_refit_batch_uses_one_collective_rpc(tmp_path: Path) -> None:
