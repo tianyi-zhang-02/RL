@@ -97,6 +97,8 @@ def _make_sparse_delta_extension(
         model=SimpleNamespace(get_submodule=lambda _name: module)
     )
     ext._direct_sparse_delta_plan_cache = {}
+    ext._direct_sparse_delta_verification = None
+    ext._direct_sparse_delta_verification_candidates = 0
     return ext
 
 
@@ -173,6 +175,30 @@ def test_direct_sparse_delta_placement() -> None:
         {"name": qkv_source, "shape": (2, 2)}, qkv_source, {qkv_name: qkv_target}
     )
     _assert_sparse_plan(ext, plan, [0, 1, 2, 3], [8, 9, 10, 11], [0.0, 1.0, 2.0, 3.0])
+
+    merged_name = "model.layers.0.mlp.gate_up_proj.weight"
+    merged_target = _attach_tensor_attrs(torch.zeros(8, 2), output_dim=0)
+    ext = _make_sparse_delta_extension(
+        merged_name,
+        merged_target,
+        SimpleNamespace(tp_rank=1, tp_size=2, output_sizes=(8, 8)),
+    )
+    for projection, expected_locations in (
+        ("gate", [0, 1, 6, 7]),
+        ("up", [8, 9, 14, 15]),
+    ):
+        source_name = f"model.layers.0.mlp.{projection}_proj.weight"
+        plan = ext._direct_sparse_delta_target_plan(
+            {"name": source_name, "shape": (8, 2)},
+            {merged_name: merged_target},
+        )
+        _assert_sparse_plan(
+            ext,
+            plan,
+            [6, 7, 8, 9, 14, 15],
+            expected_locations,
+            [2.0, 3.0, 4.0, 5.0],
+        )
 
     expert_name = "model.layers.0.mlp.experts.w13_weight"
     expert_target = torch.zeros(2, 4, 2)
@@ -267,6 +293,72 @@ def test_direct_sparse_delta_placement() -> None:
             {"name": "down_proj.weight", "shape": source_shape}, target
         )
         _assert_sparse_plan(ext, plan, source_locations, expected_locations, values)
+
+
+@pytest.mark.vllm
+@pytest.mark.parametrize(
+    ("initial", "expected_delta", "exact_mismatches", "mismatches"),
+    [
+        (200.0, 4.0, 0, 0),
+        (2.0, 4.0000005, 1, 0),
+        (2.0, 5.0, 1, 1),
+    ],
+)
+def test_sparse_delta_sample_verification_only_compares_applied_delta(
+    monkeypatch,
+    initial: float,
+    expected_delta: float,
+    exact_mismatches: int,
+    mismatches: int,
+) -> None:
+    from nemo_rl.models.generation.vllm.vllm_backend import (
+        VllmInternalWorkerExtension,
+    )
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.vllm.quantization.fp8.is_fp8_model",
+        lambda _config: False,
+    )
+    target = torch.tensor([1.0, initial, 3.0, initial])
+    ext = VllmInternalWorkerExtension.__new__(VllmInternalWorkerExtension)
+    ext.model_runner = SimpleNamespace(
+        model=SimpleNamespace(),
+        vllm_config=SimpleNamespace(
+            model_config=SimpleNamespace(architectures=[]),
+        ),
+    )
+    ext._direct_sparse_delta_targets = {"weight": target}
+    ext._direct_sparse_delta_plan_cache = {
+        "weight": ext._make_sparse_delta_target_plan(target, (4,))
+    }
+    ext._direct_sparse_delta_verification = None
+    ext._direct_sparse_delta_verification_candidates = 0
+    metadata = [
+        {
+            "name": "weight",
+            "shape": (4,),
+            "index_encoding": "range",
+            "range_start": 1,
+            "value_start": 0,
+            "value_end": 2,
+            "verification_locations": [1, 3],
+            "verification_deltas": [expected_delta, expected_delta],
+        }
+    ]
+
+    ext._apply_sparse_weight_deltas(
+        (torch.empty(0, dtype=torch.uint8), torch.tensor([4.0, 4.0])), metadata
+    )
+    result = ext.finish_sparse_delta_refit()
+
+    assert torch.equal(target, torch.tensor([1.0, initial + 4.0, 3.0, initial + 4.0]))
+    assert result["verification_candidates"] == 2
+    assert result["verification_samples"] == 2
+    assert result["verification_exact_mismatches"] == 2 * exact_mismatches
+    assert result["verification_mismatches"] == 2 * mismatches
+    rounded_difference = float((torch.tensor(expected_delta) - 4).abs())
+    assert result["verification_max_abs"] == rounded_difference
 
 
 @pytest.mark.vllm

@@ -15,6 +15,7 @@
 import asyncio
 import logging
 import os
+import sys
 import warnings
 from collections import defaultdict
 from typing import (
@@ -1079,7 +1080,8 @@ class VllmGeneration(GenerationInterface):
         the object is lost due to leaving a function scope. It's always recommended that the
         user calls shutdown().
         """
-        self.shutdown()
+        if not sys.is_finalizing():
+            self.shutdown()
 
     def invalidate_kv_cache(self) -> bool:
         """Invalidate reusable caches in vLLM (e.g., prefix/KV cache) after weight updates.

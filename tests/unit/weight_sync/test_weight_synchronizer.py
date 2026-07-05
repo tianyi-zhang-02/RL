@@ -82,7 +82,7 @@ def _mock_cluster(world_size=4, ip="127.0.0.1", port=29500):
 def _remote_sparse_sync(
     mock_ray: MagicMock,
     transport: str,
-    stream_result: list[int] | RuntimeError,
+    stream_result: list[dict[str, int]] | RuntimeError,
 ) -> tuple[VllmRemoteSparseWeightSynchronizer, MagicMock, MagicMock]:
     policy = MagicMock()
     policy.init_remote_sparse_delta_baseline.return_value = [MagicMock()]
@@ -254,9 +254,25 @@ class TestVllmRemoteSparseWeightSynchronizer:
         "nemo_rl.weight_sync.vllm_remote_sparse_weight_synchronizer.flush_vllm_refit_urls"
     )
     @patch("nemo_rl.weight_sync.vllm_remote_sparse_weight_synchronizer.ray")
-    def test_initializes_streams_commits_and_updates_baseline(self, mock_ray, flush):
-        sync, policy, generation = _remote_sparse_sync(mock_ray, "zmq", [3])
-        sync.sync_weights()
+    def test_initializes_streams_commits_and_updates_baseline(
+        self, mock_ray, flush, capsys
+    ):
+        sync, policy, generation = _remote_sparse_sync(
+            mock_ray,
+            "zmq",
+            [{"payloads": 3, "changed_elements": 3, "total_elements": 100}],
+        )
+        flush.return_value = [
+            {
+                "verification_candidates": 4,
+                "verification_samples": 4,
+                "verification_exact_mismatches": 1,
+                "verification_mismatches": 0,
+                "verification_abs_sum": 1e-9,
+                "verification_max_abs": 1e-9,
+            }
+        ]
+        metrics = sync.sync_weights()
 
         policy.init_remote_sparse_delta_baseline.assert_called_once_with("zmq")
         generation.start_zmq_sparse_refit_relays.assert_called_once_with(
@@ -267,7 +283,43 @@ class TestVllmRemoteSparseWeightSynchronizer:
             ["http://receiver"], api_key_env_var=None, timeout_s=600.0
         )
         policy.finish_remote_sparse_delta_sync.assert_called_once_with(True)
+        assert (
+            "REFIT_ZMQ_DELTA_CHANGE changed_elements=3 total_elements=100 "
+            "changed_pct=3" in capsys.readouterr().out
+        )
+        assert metrics["delta/changed_pct"] == 3.0
+        assert metrics["delta_verify/candidates"] == 4.0
+        assert metrics["delta_verify/samples"] == 4.0
+        assert metrics["delta_verify/exact_mismatches"] == 1.0
+        assert metrics["delta_verify/mismatches"] == 0.0
+        assert metrics["delta_verify/mean_abs"] == 2.5e-10
+        assert metrics["delta_verify/max_abs"] == 1e-9
+        assert metrics["transfer/payloads"] == 3.0
         assert not sync.is_stale
+
+    @patch(
+        "nemo_rl.weight_sync.vllm_remote_sparse_weight_synchronizer.flush_vllm_refit_urls"
+    )
+    @patch("nemo_rl.weight_sync.vllm_remote_sparse_weight_synchronizer.ray")
+    def test_sample_mismatch_does_not_commit_baseline(self, mock_ray, flush):
+        sync, policy, _ = _remote_sparse_sync(
+            mock_ray,
+            "zmq",
+            [{"payloads": 3, "changed_elements": 3, "total_elements": 100}],
+        )
+        flush.return_value = [
+            {
+                "verification_samples": 4,
+                "verification_mismatches": 1,
+                "verification_abs_sum": 0.5,
+                "verification_max_abs": 0.5,
+            }
+        ]
+
+        with pytest.raises(RuntimeError, match="1 mismatched deltas out of 4"):
+            sync.sync_weights()
+
+        policy.finish_remote_sparse_delta_sync.assert_called_once_with(False)
 
     @patch(
         "nemo_rl.weight_sync.vllm_remote_sparse_weight_synchronizer.flush_vllm_refit_urls"

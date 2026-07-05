@@ -121,6 +121,10 @@ class VllmInternalWorkerExtension:
     _direct_sparse_delta_plan_cache: dict[str, _SparseDeltaTargetPlan | None] | None = (
         None
     )
+    _direct_sparse_delta_verification: (
+        list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] | None
+    ) = None
+    _direct_sparse_delta_verification_candidates = 0
 
     def init_collective(
         self,
@@ -184,6 +188,8 @@ class VllmInternalWorkerExtension:
         self.state_dict_info = state_dict_info  # pyrefly: ignore[implicitly-defined-attribute]  This class does not define __init__ so assignments like this should be ignored
         self._direct_sparse_delta_targets = None
         self._direct_sparse_delta_plan_cache = None
+        self._direct_sparse_delta_verification = []
+        self._direct_sparse_delta_verification_candidates = 0
 
     def _process_weights_after_loading(
         self,
@@ -418,8 +424,41 @@ class VllmInternalWorkerExtension:
         with torch.no_grad():
             for item, plan in plans:
                 target = plan.target
+                verification_locations = item.get("verification_locations", [])
+                self._direct_sparse_delta_verification_candidates += len(
+                    verification_locations
+                )
                 if target is None:
                     continue
+
+                if verification_locations and not plan.log_delta_transform:
+                    sample_locations, sample_deltas = (
+                        self._local_sparse_delta_update_inputs(
+                            torch.tensor(verification_locations, device=target.device),
+                            torch.tensor(
+                                item["verification_deltas"],
+                                device=target.device,
+                                dtype=target.dtype,
+                            ),
+                            plan,
+                        )
+                    )
+                    if sample_locations.numel():
+                        before = target.data.view(-1).index_select(0, sample_locations)
+                        expected_delta = (
+                            before + sample_deltas
+                        ).float() - before.float()
+                        verification = self._direct_sparse_delta_verification
+                        if verification is None:
+                            verification = self._direct_sparse_delta_verification = []
+                        verification.append(
+                            (
+                                target,
+                                sample_locations,
+                                before.float(),
+                                expected_delta,
+                            )
+                        )
 
                 value_start = int(item["value_start"])
                 value_end = int(item["value_end"])
@@ -434,26 +473,27 @@ class VllmInternalWorkerExtension:
                     target.data.view(-1).narrow(0, range_start, range_count).add_(
                         values
                     )
-                    continue
-
-                locations = sparse_codec.sparse_locations_for_item(
-                    item,
-                    raw_locations,
-                    device=target.device,
-                )
-                locations, values = self._local_sparse_delta_update_inputs(
-                    locations,
-                    values,
-                    plan,
-                )
-                if locations.numel():
-                    target_flat = target.data.view(-1)
-                    if plan.log_delta_transform:
-                        current = target_flat.index_select(0, locations)
-                        updated = current * values.float().exp().to(dtype=current.dtype)
-                        target_flat.index_copy_(0, locations, updated)
-                    else:
-                        target_flat.index_add_(0, locations, values)
+                else:
+                    locations = sparse_codec.sparse_locations_for_item(
+                        item,
+                        raw_locations,
+                        device=target.device,
+                    )
+                    locations, values = self._local_sparse_delta_update_inputs(
+                        locations,
+                        values,
+                        plan,
+                    )
+                    if locations.numel():
+                        target_flat = target.data.view(-1)
+                        if plan.log_delta_transform:
+                            current = target_flat.index_select(0, locations)
+                            updated = current * values.float().exp().to(
+                                dtype=current.dtype
+                            )
+                            target_flat.index_copy_(0, locations, updated)
+                        else:
+                            target_flat.index_add_(0, locations, values)
 
     def _direct_sparse_delta_module(
         self,
@@ -489,6 +529,12 @@ class VllmInternalWorkerExtension:
             return self._direct_sparse_delta_qkv_plan(item, target_name, targets)
         if _EXPERT_WEIGHT_RE.match(target_name):
             return self._direct_sparse_delta_expert_plan(item, target_name, targets)
+        if any(f".{candidate}_proj." in target_name for candidate in ("gate", "up")):
+            merged_plan = self._direct_sparse_delta_merged_column_plan(
+                item, target_name, targets
+            )
+            if merged_plan is not None:
+                return merged_plan
 
         target = targets.get(target_name)
         if target is None:
@@ -529,6 +575,52 @@ class VllmInternalWorkerExtension:
             shard_start=shard_start,
             shard_size=min(shard_size, source_shape[output_dim] - shard_start),
             target_offset=shard_offset * target.stride(output_dim),
+        )
+
+    def _direct_sparse_delta_merged_column_plan(
+        self,
+        item: dict[str, Any],
+        target_name: str,
+        targets: dict[str, torch.Tensor],
+    ) -> _SparseDeltaTargetPlan | None:
+        projection = next(
+            candidate
+            for candidate in ("gate", "up")
+            if f".{candidate}_proj." in target_name
+        )
+        shard_id = 0 if projection == "gate" else 1
+        packed_name = target_name.replace(f".{projection}_proj.", ".gate_up_proj.", 1)
+        target = targets.get(packed_name)
+        output_dim = getattr(target, "output_dim", None)
+        if target is None or not isinstance(output_dim, int):
+            return None
+
+        output_dim %= target.ndim
+        module = self._direct_sparse_delta_module(target, packed_name.rsplit(".", 1)[0])
+        output_sizes = tuple(int(size) for size in module.output_sizes)
+        tp_size = int(module.tp_size)
+        source_shape = tuple(item["shape"])
+        if (
+            shard_id >= len(output_sizes)
+            or tp_size < 1
+            or output_sizes[shard_id] % tp_size
+            or output_dim >= len(source_shape)
+            or source_shape[output_dim] != output_sizes[shard_id]
+        ):
+            return None
+
+        shard_size = output_sizes[shard_id] // tp_size
+        target_start = sum(output_sizes[:shard_id]) // tp_size
+        if target.shape[output_dim] < target_start + shard_size:
+            return None
+        shard_start = int(module.tp_rank) * shard_size
+        return self._make_sparse_delta_target_plan(
+            target,
+            source_shape=source_shape,
+            shard_dim=output_dim,
+            shard_start=shard_start,
+            shard_size=shard_size,
+            target_offset=target_start * target.stride(output_dim),
         )
 
     def _direct_sparse_delta_mamba2_plan(
@@ -1048,6 +1140,55 @@ class VllmInternalWorkerExtension:
         """Synchronize this vLLM worker's CUDA device after deferred refit applies."""
         if torch.cuda.is_available():
             torch.cuda.synchronize(self.device)
+
+    def finish_sparse_delta_refit(self) -> dict[str, Any]:
+        """Synchronize and compare bounded producer samples with applied weights."""
+        self.synchronize_device()
+        verification = self._direct_sparse_delta_verification or []
+        candidates = self._direct_sparse_delta_verification_candidates
+        self._direct_sparse_delta_verification = []
+        self._direct_sparse_delta_verification_candidates = 0
+        if not verification:
+            return {
+                "ok": True,
+                "verification_candidates": candidates,
+                "verification_samples": 0,
+                "verification_exact_mismatches": 0,
+                "verification_mismatches": 0,
+                "verification_abs_sum": 0.0,
+                "verification_max_abs": 0.0,
+            }
+
+        with torch.no_grad():
+            actual_delta = torch.cat(
+                [
+                    target.data.view(-1).index_select(0, locations).float() - before
+                    for target, locations, before, _ in verification
+                ]
+            )
+            expected_delta = torch.cat([expected for _, _, _, expected in verification])
+            difference = (actual_delta - expected_delta).abs()
+            exact_mismatches = actual_delta.ne(expected_delta)
+            mismatches = ~torch.isclose(
+                actual_delta, expected_delta, rtol=1e-6, atol=1e-8
+            )
+            stats = torch.stack(
+                (
+                    difference.sum(),
+                    difference.max(),
+                    exact_mismatches.sum().float(),
+                    mismatches.sum().float(),
+                )
+            ).cpu()
+        return {
+            "ok": True,
+            "verification_candidates": candidates,
+            "verification_samples": actual_delta.numel(),
+            "verification_exact_mismatches": int(stats[2]),
+            "verification_mismatches": int(stats[3]),
+            "verification_abs_sum": float(stats[0]),
+            "verification_max_abs": float(stats[1]),
+        }
 
     def cleanup(self) -> None:
         """Shutdown and cleanup resources."""

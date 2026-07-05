@@ -48,11 +48,48 @@ def test_delta_tracker_commits_only_successful_syncs(monkeypatch) -> None:
     tracker.snapshot_baseline([("weight", tensor)])
     tensor[1] += 4
 
-    assert tracker.prepare_sparse_delta_payload([("weight", tensor)])[2]
+    assert tracker.prepare_sparse_delta_payload([("weight", tensor)])[0][2]
     tracker.on_sync_failed()
-    assert tracker.prepare_sparse_delta_payload([("weight", tensor)])[2]
+    assert tracker.prepare_sparse_delta_payload([("weight", tensor)])[0][2]
     tracker.on_sync_succeeded()
-    assert not tracker.prepare_sparse_delta_payload([("weight", tensor)])[2]
+    assert not tracker.prepare_sparse_delta_payload([("weight", tensor)])[0][2]
+
+
+def test_delta_tracker_emits_bounded_delta_samples(monkeypatch) -> None:
+    monkeypatch.setenv("NRL_REFIT_BASELINE_IN_MEMORY", "1")
+    monkeypatch.setenv("NRL_REFIT_VERIFY_SAMPLES_PER_PAYLOAD", "2")
+    tracker = DeltaCompressionTracker(
+        {"dtype": "bf16", "sparse_bucket_size_bytes": 1024}
+    )
+    tensor = torch.tensor([1.0, 2.0, 3.0, 4.0])
+    tracker.snapshot_baseline([("weight", tensor)])
+    tensor[[1, 3]] += 1
+
+    (_, _, metadata), changed, total = tracker.prepare_sparse_delta_payload(
+        [("weight", tensor)]
+    )
+
+    assert metadata[0]["verification_locations"] == [1, 3]
+    assert metadata[0]["verification_deltas"] == [1.0, 1.0]
+    assert (changed, total) == (2, 4)
+
+
+def test_delta_tracker_commits_quantized_receiver_baseline(monkeypatch) -> None:
+    monkeypatch.setenv("NRL_REFIT_BASELINE_IN_MEMORY", "1")
+    tracker = DeltaCompressionTracker(
+        {"dtype": "bf16", "sparse_bucket_size_bytes": 1024}
+    )
+    tensor = torch.tensor([1.0])
+    tracker.snapshot_baseline([("weight", tensor)])
+    tensor.add_(0.001)
+
+    (_, deltas, _), _, _ = tracker.prepare_sparse_delta_payload([("weight", tensor)])
+    expected = torch.tensor([1.0]) + deltas.float()
+    tracker.on_sync_succeeded()
+    tracker.prepare_sparse_delta_payload([("weight", tensor)])
+
+    assert torch.equal(tracker.baseline["weight"], expected)
+    assert not torch.equal(expected, tensor)
 
 
 def test_sparse_index_encoding_preserves_uint64_locations() -> None:
@@ -86,6 +123,17 @@ def test_s3_download_verifies_checksum(monkeypatch) -> None:
         download_s3_refit_payload(manifest)
 
 
+def test_refit_http_session_does_not_retry_application_errors() -> None:
+    retry = (
+        weight_transfer_remote_sparse.refit_http_session()
+        .get_adapter("http://")
+        .max_retries
+    )
+
+    assert 500 not in retry.status_forcelist
+    assert {502, 503, 504} <= set(retry.status_forcelist)
+
+
 def test_sparse_export_finishes_before_blocked_transfers(monkeypatch) -> None:
     monkeypatch.setenv("NRL_REFIT_ZMQ_ENCODE_WORKERS", "1")
     monkeypatch.setenv("NRL_REFIT_ZMQ_EXPORT_CHUNK_BYTES", "1")
@@ -98,7 +146,7 @@ def test_sparse_export_finishes_before_blocked_transfers(monkeypatch) -> None:
 
         @staticmethod
         def prepare_sparse_delta_payload(chunk):
-            return chunk, torch.ones(1), [1]
+            return (chunk, torch.ones(1), [1]), 1, 1
 
     def tensors():
         for index in range(4):
@@ -131,7 +179,7 @@ def test_sparse_export_finishes_before_blocked_transfers(monkeypatch) -> None:
         thread.join(timeout=5.0)
 
     assert not thread.is_alive()
-    assert result == [4]
+    assert result == [{"payloads": 4, "changed_elements": 4, "total_elements": 4}]
 
 
 def test_sparse_export_finishes_before_transfer_error(monkeypatch) -> None:
@@ -144,7 +192,7 @@ def test_sparse_export_finishes_before_transfer_error(monkeypatch) -> None:
 
         @staticmethod
         def prepare_sparse_delta_payload(chunk):
-            return chunk, torch.ones(1), [1]
+            return (chunk, torch.ones(1), [1]), 1, 1
 
     def tensors():
         for index in range(4):

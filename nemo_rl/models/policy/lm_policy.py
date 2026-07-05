@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import os
+import sys
 import warnings
 from collections import defaultdict
 from contextlib import nullcontext
@@ -1157,7 +1158,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         the object is lost due to leaving a function scope. It's always recommended that the
         user calls worker_group.shutdown().
         """
-        if hasattr(self, "worker_group"):
+        if not sys.is_finalizing() and hasattr(self, "worker_group"):
             self.worker_group.shutdown(cleanup_method="shutdown")
 
     def start_gpu_profiling(self) -> None:

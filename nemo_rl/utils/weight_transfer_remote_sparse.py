@@ -23,7 +23,7 @@ from collections.abc import Iterable, Iterator, Mapping, Sequence
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from contextlib import suppress
 from functools import cache
-from typing import Any, Callable
+from typing import Any, Callable, TypedDict
 from urllib.parse import quote
 
 import requests
@@ -44,6 +44,12 @@ G_VLLM_REFIT_API_KEY_HEADER = "x-nemo-rl-refit-key"
 _CONTROL_SESSION_LOCAL = threading.local()
 _S3_PART_SIZE = 64 * 1024**2
 _S3_MEMORY_LIMIT = 2 * 1024**3
+
+
+class SparseDeltaStreamResult(TypedDict):
+    payloads: int
+    changed_elements: int
+    total_elements: int
 
 
 @cache
@@ -200,7 +206,7 @@ def refit_http_session() -> requests.Session:
             max_retries=Retry(
                 total=3,
                 backoff_factor=0.25,
-                status_forcelist=(500, 502, 503, 504),
+                status_forcelist=(502, 503, 504),
                 allowed_methods={"POST"},
             ),
         )
@@ -287,7 +293,7 @@ def stream_sparse_delta_payloads(
     transfer_workers: int,
     shard_rank: int,
     shard_count: int,
-) -> int:
+) -> SparseDeltaStreamResult:
     prefix = transport.upper()
     encode_workers = refit_env_int(
         f"NRL_REFIT_{prefix}_ENCODE_WORKERS",
@@ -298,12 +304,16 @@ def stream_sparse_delta_payloads(
     transfer_executor = _executor(f"refit-{transport}-transfer", transfer_workers)
     export_chunk_size = sparse_export_chunk_size(delta_tracker, transport)
 
-    def encode_chunk(chunk: TensorBatch) -> tuple[bytes, dict[str, float]] | None:
+    def encode_chunk(
+        chunk: TensorBatch,
+    ) -> tuple[bytes | None, dict[str, float], int, int]:
         started = time.perf_counter()
-        payload = delta_tracker.prepare_sparse_delta_payload(chunk)
+        payload, changed_elements, total_elements = (
+            delta_tracker.prepare_sparse_delta_payload(chunk)
+        )
         encode_s = time.perf_counter() - started
         if not payload[2]:
-            return None
+            return None, {"encode_s": encode_s}, changed_elements, total_elements
         started = time.perf_counter()
         buffer = io.BytesIO()
         torch.save(payload, buffer)
@@ -312,11 +322,16 @@ def stream_sparse_delta_payloads(
         started = time.perf_counter()
         body = zstd_compress(raw_body, f"NRL_REFIT_{prefix}_ZSTD_THREADS")
         compress_s = time.perf_counter() - started
-        return body, {
-            "encode_s": encode_s,
-            "serialize_s": serialize_s,
-            "compress_s": compress_s,
-        }
+        return (
+            body,
+            {
+                "encode_s": encode_s,
+                "serialize_s": serialize_s,
+                "compress_s": compress_s,
+            },
+            changed_elements,
+            total_elements,
+        )
 
     def transfer_payload(
         encoded: tuple[bytes, dict[str, float]], payload_index: int
@@ -331,7 +346,12 @@ def stream_sparse_delta_payloads(
 
     timing: dict[str, float] = {}
     receiver_timing: dict[str, float] = {}
-    counts = {"payloads": 0, "wire_bytes": 0}
+    counts = {
+        "payloads": 0,
+        "wire_bytes": 0,
+        "changed_elements": 0,
+        "total_elements": 0,
+    }
     chunk_count = 0
     export_pull_s = 0.0
     encode_inflight: dict[Any, int] = {}
@@ -371,11 +391,14 @@ def stream_sparse_delta_payloads(
             except Exception as error:
                 worker_errors.append(error)
                 continue
-            if encoded is not None:
+            body, encode_timing, changed_elements, total_elements = encoded
+            counts["changed_elements"] += changed_elements
+            counts["total_elements"] += total_elements
+            if body is not None:
                 transfer_inflight.add(
                     transfer_executor.submit(
                         transfer_payload,
-                        encoded,
+                        (body, encode_timing),
                         payload_index,
                     )
                 )
@@ -423,6 +446,11 @@ def stream_sparse_delta_payloads(
         "export_chunk_mb": export_chunk_size / 1e6,
         "shard_rank": shard_rank,
         "shard_count": shard_count,
+        "changed_elements": counts["changed_elements"],
+        "total_elements": counts["total_elements"],
+        "changed_pct": 100.0
+        * counts["changed_elements"]
+        / max(counts["total_elements"], 1),
     }
     timing.update(receiver_timing)
     print(
@@ -430,7 +458,11 @@ def stream_sparse_delta_payloads(
         + " ".join(f"{key}={value}" for key, value in timing.items()),
         flush=True,
     )
-    return counts["payloads"]
+    return {
+        "payloads": counts["payloads"],
+        "changed_elements": counts["changed_elements"],
+        "total_elements": counts["total_elements"],
+    }
 
 
 def stream_sparse_delta_payloads_via_s3_manifest(
@@ -443,7 +475,7 @@ def stream_sparse_delta_payloads_via_s3_manifest(
     timeout_s: float,
     shard_rank: int,
     shard_count: int,
-) -> int:
+) -> SparseDeltaStreamResult:
     urls = [url.strip().rstrip("/") for url in refit_targets if url.strip()]
     if not urls:
         raise ValueError("At least one vLLM S3 refit URL is required.")
@@ -544,12 +576,12 @@ def flush_vllm_refit_urls(
     *,
     api_key_env_var: str | None,
     timeout_s: float,
-) -> None:
+) -> list[dict[str, Any]]:
     endpoint_urls = [
         f"{url}{G_VLLM_REFIT_FLUSH_PATH}"
         for url in (url.strip().rstrip("/") for url in base_urls if url.strip())
     ]
-    post_vllm_refit_endpoints(
+    return post_vllm_refit_endpoints(
         endpoint_urls,
         {},
         api_key=vllm_refit_api_key(api_key_env_var),

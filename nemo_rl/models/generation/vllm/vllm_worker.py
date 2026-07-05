@@ -688,12 +688,28 @@ class BaseVllmGenerationWorker:
 
     @staticmethod
     def _refit_collective_response(worker_results: Any) -> dict[str, Any]:
-        return {
+        results = cast(list[dict[str, Any]], worker_results)
+        response = {
             "ok": True,
-            **merge_vllm_refit_receiver_timing(
-                {}, cast(list[dict[str, Any]], worker_results), maximum=True
-            ),
+            **merge_vllm_refit_receiver_timing({}, results, maximum=True),
         }
+        if any("verification_candidates" in result for result in results):
+            response["verification_candidates"] = max(
+                (int(result["verification_candidates"]) for result in results),
+                default=0,
+            )
+            for key in (
+                "verification_samples",
+                "verification_exact_mismatches",
+                "verification_mismatches",
+                "verification_abs_sum",
+            ):
+                response[key] = sum(result[key] for result in results)
+            response["verification_max_abs"] = max(
+                (float(result["verification_max_abs"]) for result in results),
+                default=0.0,
+            )
+        return response
 
     def _flush_queued_sparse_payloads(self) -> dict[str, Any]:
         started = time.perf_counter()
@@ -713,7 +729,11 @@ class BaseVllmGenerationWorker:
         response = self._collect_refit_apply_results(futures)
         if futures:
             assert self.llm is not None
-            self.llm.collective_rpc("synchronize_device", args=())
+            response.update(
+                self._refit_collective_response(
+                    self.llm.collective_rpc("finish_sparse_delta_refit", args=())
+                )
+            )
         with self._refit_apply_queue_condition:
             self._refit_seen_payloads.clear()
         response.update(
@@ -726,7 +746,16 @@ class BaseVllmGenerationWorker:
                 "REFIT_RECEIVER_TIMING "
                 f"payloads={payload_count} batches={batch_count} "
                 f"total_s={response['seconds']:.3f} "
-                f"payload_total_s={response.get('receiver_total_s', 0.0):.3f}",
+                f"payload_total_s={response.get('receiver_total_s', 0.0):.3f} "
+                f"delta_verify_candidates="
+                f"{response.get('verification_candidates', 0)} "
+                f"delta_verify_samples={response.get('verification_samples', 0)} "
+                f"delta_verify_exact_mismatches="
+                f"{response.get('verification_exact_mismatches', 0)} "
+                f"delta_verify_mismatches="
+                f"{response.get('verification_mismatches', 0)} "
+                f"delta_verify_max_abs="
+                f"{response.get('verification_max_abs', 0.0):.8g}",
                 flush=True,
             )
         return response
@@ -1283,12 +1312,19 @@ class VllmGenerationWorkerImpl(BaseVllmGenerationWorker):
                 with open(path, "wb") as staged:
                     staged.write(payload)
                 paths.append(path)
-            response = self._refit_collective_response(
-                self.llm.collective_rpc(
-                    "update_weights_from_sparse_payload_files",
-                    args=tuple(paths),
+            try:
+                response = self._refit_collective_response(
+                    self.llm.collective_rpc(
+                        "update_weights_from_sparse_payload_files",
+                        args=tuple(paths),
+                    )
                 )
-            )
+            except Exception:
+                # Ray may surface one worker error before peers finish reading
+                # the shared files. Queueing a barrier drains those calls before
+                # TemporaryDirectory removes the batch.
+                self.llm.collective_rpc("synchronize_device", args=())
+                raise
         response["payloads"] = len(serialized_payloads)
         return response
 

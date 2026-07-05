@@ -94,6 +94,7 @@ from nemo_rl.utils.nvml import log_gpu_memory_diagnostics
 from nemo_rl.utils.packed_tensor import packed_broadcast_producer
 from nemo_rl.utils.r3_trace import maybe_r3_trace_stage
 from nemo_rl.utils.weight_transfer_remote_sparse import (
+    SparseDeltaStreamResult,
     init_sparse_delta_baseline_from_iterator,
     stream_sparse_delta_payloads_via_s3_manifest,
 )
@@ -346,7 +347,10 @@ class MegatronPolicyWorkerImpl(
         self.is_generation_colocated = runtime_config.is_generation_colocated
         self.final_padded_vocab_size = runtime_config.final_padded_vocab_size
         self.sampling_params = runtime_config.sampling_params
-        delta_config = self.cfg["generation"].get("delta_compression")
+        generation_config = self.cfg.get("generation")
+        delta_config = None
+        if generation_config is not None and generation_config["backend"] == "vllm":
+            delta_config = cast(VllmConfig, generation_config).get("delta_compression")
         self.delta_weight_transfer_tracker = (
             DeltaCompressionTracker(delta_config) if delta_config else None
         )
@@ -1253,7 +1257,7 @@ class MegatronPolicyWorkerImpl(
         timeout_s: float,
         shard_rank: int,
         shard_count: int,
-    ) -> int:
+    ) -> SparseDeltaStreamResult:
         """Stream compressed sparse deltas through the selected value plane."""
         tracker = self.delta_weight_transfer_tracker
         assert tracker is not None

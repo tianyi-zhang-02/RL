@@ -52,7 +52,7 @@ class VllmRemoteSparseWeightSynchronizer(WeightSynchronizer):
         *,
         timer: Timer | None = None,
         kv_scales: dict[str, float] | None = None,
-    ) -> None:
+    ) -> dict[str, float]:
         timer_context = (
             timer.time("prepare_for_generation/transfer_and_update_weights")
             if timer is not None
@@ -82,18 +82,78 @@ class VllmRemoteSparseWeightSynchronizer(WeightSynchronizer):
                     timeout_s=self._request_timeout_s,
                 )
                 results = ray.get(refs)
-                payloads = sum(int(result) for result in results)
+                payloads = sum(result["payloads"] for result in results)
+                changed_elements = sum(result["changed_elements"] for result in results)
+                total_elements = sum(result["total_elements"] for result in results)
+                changed_pct = 100.0 * changed_elements / max(total_elements, 1)
+                print(
+                    f"REFIT_{self._transport.upper()}_DELTA_CHANGE "
+                    f"changed_elements={changed_elements} "
+                    f"total_elements={total_elements} "
+                    f"changed_pct={changed_pct:.8g}",
+                    flush=True,
+                )
+                candidates = 0
+                samples = 0
+                exact_mismatches = 0
+                mismatches = 0
+                abs_sum = 0.0
+                max_abs = 0.0
+                commit_s = 0.0
                 if payloads:
                     started = time.perf_counter()
-                    flush_vllm_refit_urls(
+                    receiver_results = flush_vllm_refit_urls(
                         self._refit_urls,
                         api_key_env_var=self._api_key_env_var,
                         timeout_s=self._request_timeout_s,
                     )
+                    candidates = sum(
+                        int(result.get("verification_candidates", 0))
+                        for result in receiver_results
+                    )
+                    samples = sum(
+                        int(result.get("verification_samples", 0))
+                        for result in receiver_results
+                    )
+                    exact_mismatches = sum(
+                        int(result.get("verification_exact_mismatches", 0))
+                        for result in receiver_results
+                    )
+                    mismatches = sum(
+                        int(result.get("verification_mismatches", 0))
+                        for result in receiver_results
+                    )
+                    abs_sum = sum(
+                        float(result.get("verification_abs_sum", 0.0))
+                        for result in receiver_results
+                    )
+                    max_abs = max(
+                        (
+                            float(result.get("verification_max_abs", 0.0))
+                            for result in receiver_results
+                        ),
+                        default=0.0,
+                    )
+                    if candidates or samples:
+                        print(
+                            f"REFIT_{self._transport.upper()}_DELTA_VERIFY "
+                            f"candidates={candidates} samples={samples} "
+                            f"exact_mismatches={exact_mismatches} "
+                            f"mismatches={mismatches} "
+                            f"mean_abs={abs_sum / max(samples, 1):.8g} "
+                            f"max_abs={max_abs:.8g}",
+                            flush=True,
+                        )
+                    if mismatches:
+                        raise RuntimeError(
+                            f"Sparse refit sampled {mismatches} mismatched deltas "
+                            f"out of {samples}."
+                        )
+                    commit_s = time.perf_counter() - started
                     print(
                         f"REFIT_{self._transport.upper()}_GLOBAL_COMMIT "
                         f"transfer_id={transfer_id} payloads={payloads} "
-                        f"seconds={time.perf_counter() - started:.3f}",
+                        f"seconds={commit_s:.3f}",
                         flush=True,
                     )
                 succeeded = True
@@ -109,6 +169,20 @@ class VllmRemoteSparseWeightSynchronizer(WeightSynchronizer):
                     self._policy.finish_remote_sparse_delta_sync(succeeded)
                 )
         self._stale = False
+        return {
+            "delta/changed_elements": float(changed_elements),
+            "delta/total_elements": float(total_elements),
+            "delta/changed_pct": changed_pct,
+            "delta_verify/candidates": float(candidates),
+            "delta_verify/samples": float(samples),
+            "delta_verify/exact_mismatches": float(exact_mismatches),
+            "delta_verify/mismatches": float(mismatches),
+            "delta_verify/mismatch_pct": 100.0 * mismatches / max(samples, 1),
+            "delta_verify/mean_abs": abs_sum / max(samples, 1),
+            "delta_verify/max_abs": max_abs,
+            "transfer/payloads": float(payloads),
+            "transfer/global_commit_s": commit_s,
+        }
 
     @property
     def is_stale(self) -> bool:

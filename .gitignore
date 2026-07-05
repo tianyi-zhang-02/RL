@@ -1,5 +1,8 @@
 # Adding to .gitignore helps reduce the size of your working_dir
 
+profiles
+session
+
 /.git
 *.out
 *.log

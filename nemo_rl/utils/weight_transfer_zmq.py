@@ -25,6 +25,7 @@ from typing import Any
 import zmq
 
 from nemo_rl.utils.weight_transfer_remote_sparse import (
+    SparseDeltaStreamResult,
     merge_vllm_refit_receiver_timing,
     post_vllm_refit_endpoints,
     refit_env_int,
@@ -360,7 +361,7 @@ def stream_sparse_delta_payloads_via_zmq(
     timeout_s: float,
     shard_rank: int,
     shard_count: int,
-) -> int:
+) -> SparseDeltaStreamResult:
     addresses = [address.strip() for address in refit_targets if address.strip()]
     if not addresses:
         raise ValueError("At least one ZeroMQ sparse refit address is required.")

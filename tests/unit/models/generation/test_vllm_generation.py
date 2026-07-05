@@ -167,6 +167,27 @@ def test_resolve_enable_prefix_caching_uses_cuda_capability_for_auto(monkeypatch
     assert _resolve_enable_prefix_caching({}) is False
 
 
+def test_ray_owner_destructors_skip_shutdown_during_interpreter_finalization(
+    monkeypatch,
+):
+    monkeypatch.setattr(sys, "is_finalizing", lambda: True)
+
+    generation = VllmGeneration.__new__(VllmGeneration)
+    generation.shutdown = MagicMock()
+    generation.__del__()
+    generation.shutdown.assert_not_called()
+
+    policy = Policy.__new__(Policy)
+    policy.worker_group = MagicMock()
+    policy.__del__()
+    policy.worker_group.shutdown.assert_not_called()
+
+    cluster = RayVirtualCluster.__new__(RayVirtualCluster)
+    cluster.shutdown = MagicMock()
+    cluster.__del__()
+    cluster.shutdown.assert_not_called()
+
+
 @contextmanager
 def _sparse_refit_worker(
     *, batch_size: int = 2, futures: list[Future[dict[str, Any]]] | None = None
@@ -180,6 +201,7 @@ def _sparse_refit_worker(
     worker._refit_apply_queue_depth = 2
     worker._refit_apply_batch_size = batch_size
     worker.llm = MagicMock()
+    worker.llm.collective_rpc.return_value = [{"ok": True}]
     for future in worker._refit_apply_futures:
         future.add_done_callback(worker._notify_refit_apply_waiters)
     try:
@@ -217,7 +239,9 @@ def test_sparse_refit_queue_batches_payloads_in_fifo_order() -> None:
     assert response["payloads"] == 5
     assert response["batches"] == 2
     assert sum(result.get("receiver_total_s", 0.0) for result in responses) == 5.0
-    worker.llm.collective_rpc.assert_called_once_with("synchronize_device", args=())
+    worker.llm.collective_rpc.assert_called_once_with(
+        "finish_sparse_delta_refit", args=()
+    )
 
 
 def test_sparse_refit_queue_deduplicates_transactional_payloads() -> None:
@@ -293,6 +317,33 @@ def test_sparse_refit_batch_uses_one_collective_rpc(tmp_path: Path) -> None:
     assert not list(tmp_path.iterdir())
     worker.llm.collective_rpc.assert_called_once()
     assert response == {"ok": True, "receiver_total_s": 1.0, "payloads": 3}
+
+
+def test_sparse_refit_batch_drains_workers_before_error_cleanup(tmp_path: Path) -> None:
+    worker = VllmGenerationWorkerImpl.__new__(VllmGenerationWorkerImpl)
+    staged_paths: tuple[str, ...] = ()
+
+    def collective_rpc(method, args):
+        nonlocal staged_paths
+        if method == "update_weights_from_sparse_payload_files":
+            staged_paths = args
+            raise RuntimeError("apply failed")
+        assert method == "synchronize_device"
+        assert all(Path(path).is_file() for path in staged_paths)
+        return [True]
+
+    worker.llm = MagicMock(collective_rpc=MagicMock(side_effect=collective_rpc))
+    worker._refit_workers_share_node = True
+    worker._refit_batch_staging_dir = str(tmp_path)
+
+    with pytest.raises(RuntimeError, match="apply failed"):
+        worker.update_weights_from_serialized_sparse_payloads((b"0", b"1"))
+
+    assert [call.args[0] for call in worker.llm.collective_rpc.call_args_list] == [
+        "update_weights_from_sparse_payload_files",
+        "synchronize_device",
+    ]
+    assert not list(tmp_path.iterdir())
 
 
 def test_sparse_refit_batch_falls_back_across_nodes() -> None:

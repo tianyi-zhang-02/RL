@@ -1966,7 +1966,7 @@ def refit_policy_generation(
     _refit_buffer_size_gb: Optional[float] = None,
     timer: Optional[Timer] = None,
     kv_scales: Optional[dict[str, float]] = None,
-) -> None:
+) -> dict[str, float]:
     """Refit the policy generation interface with the latest policy weights.
 
     Args:
@@ -1976,16 +1976,21 @@ def refit_policy_generation(
             the buffer size is computed from remaining memory.
         timer: Optional Timer used to time the prepare/transfer/update phase
         kv_scales: Optional dictionary of KV cache scales for FP8 quantization.
+
+    Returns:
+        Scalar metrics reported by the selected weight synchronizer.
     """
     if (
         isinstance(policy_generation, VllmGeneration)
         and policy_generation.weight_synchronizer is not None
     ):
-        policy_generation.weight_synchronizer.sync_weights(
-            timer=timer,
-            kv_scales=kv_scales,
+        return (
+            policy_generation.weight_synchronizer.sync_weights(
+                timer=timer,
+                kv_scales=kv_scales,
+            )
+            or {}
         )
-        return
 
     # Megatron generation backend needs explicit suspend/resume around refits.
     if isinstance(policy_generation, MegatronGeneration):
@@ -2086,6 +2091,16 @@ def refit_policy_generation(
 
     if isinstance(policy_generation, MegatronGeneration):
         policy_generation.resume_after_refit()
+
+    return {}
+
+
+def _initial_policy_generation_stale(
+    policy_generation: GenerationInterface, completed_steps: int
+) -> bool:
+    """Skip a fresh run's redundant sync when the synchronizer is already current."""
+    synchronizer = getattr(policy_generation, "weight_synchronizer", None)
+    return completed_steps > 0 or synchronizer is None or synchronizer.is_stale
 
 
 def _log_mixed_rewards_and_advantages_information(
@@ -2276,7 +2291,6 @@ def grpo_train(
         isinstance(policy_generation, MegatronGeneration)
         and master_config.policy["generation"]["colocated"]["enabled"]
     )
-    POLICY_GENERATION_STALE = True  # tracks if generation needs a refit before running
     assert policy_generation is not None
 
     # Check if we need to sync KV cache scales
@@ -2286,6 +2300,9 @@ def grpo_train(
     # common config/state times
     current_step = grpo_save_state["current_step"]  # current step within an epoch
     total_steps = grpo_save_state["total_steps"]  # total steps across all epochs
+    POLICY_GENERATION_STALE = _initial_policy_generation_stale(
+        policy_generation, total_steps
+    )
     max_num_steps = master_config.grpo[
         "max_num_steps"
     ]  # max number of steps to train for
@@ -2351,6 +2368,7 @@ def grpo_train(
         batch_cache: BatchedDataDict[DatumSpec] = None
         # This is the number of batches we processed so far at each step to generate responses whose std is non-zero. Maximum threshold is set by dynamic_sampling_max_gen_batches. Used in the case of dynamic sampling.
         dynamic_sampling_num_gen_batches = 0
+        refit_metrics: dict[str, float] = {}
 
         # Run grpo/dapo training loop (single-turn)
         for batch in wrapped_dataloader:
@@ -2430,7 +2448,7 @@ def grpo_train(
                                 calibration_data, include_q=True
                             )["layers"]
 
-                        refit_policy_generation(
+                        refit_metrics = refit_policy_generation(
                             policy,
                             policy_generation,
                             colocated_inference,
@@ -2881,7 +2899,7 @@ def grpo_train(
                 ):
                     memory_tracker.snapshot_start_of_stage("Validation", dir())
                     if NEED_REFIT and POLICY_GENERATION_STALE:
-                        refit_policy_generation(
+                        refit_metrics = refit_policy_generation(
                             policy,
                             policy_generation,
                             colocated_inference,
@@ -3210,6 +3228,8 @@ def grpo_train(
                 train_results, metrics, timing_metrics, master_config
             )
 
+            if refit_metrics:
+                logger.log_metrics(refit_metrics, total_steps + 1, prefix="refit")
             logger.log_metrics(metrics, total_steps + 1, prefix="train")
             logger.log_metrics(
                 performance_metrics, total_steps + 1, prefix="performance"
@@ -3225,6 +3245,7 @@ def grpo_train(
             # Reset the batch and set dynamic_sampling_num_gen_batches to 0
             batch_cache = None
             dynamic_sampling_num_gen_batches = 0
+            refit_metrics = {}
 
             # Clear mem
             memory_tracker.snapshot_start_of_stage("After CPU memory clear", dir())
@@ -3523,11 +3544,11 @@ def async_grpo_train(
         isinstance(policy_generation, MegatronGeneration)
         and master_config.policy["generation"]["colocated"]["enabled"]
     )
-    POLICY_GENERATION_STALE = True
     assert policy_generation is not None
 
     # Training state
     step = grpo_save_state["current_step"]
+    POLICY_GENERATION_STALE = _initial_policy_generation_stale(policy_generation, step)
     weight_version = step  # Tracks refitted weight versions
     consumed_samples = grpo_save_state["consumed_samples"]
     total_valid_tokens = grpo_save_state.get(
@@ -3771,6 +3792,7 @@ def async_grpo_train(
     # Main training loop
     try:
         while step < master_config.grpo["max_num_steps"]:
+            refit_metrics: dict[str, float] = {}
             print(
                 f"\n{'=' * 25} Step {step + 1}/{master_config.grpo['max_num_steps']} {'=' * 25}"
             )
@@ -4110,7 +4132,7 @@ def async_grpo_train(
                     # Only the actual refit/weight transfer should be counted as weight_sync
                     print("🔄 Performing policy generation refit...")
                     with timer.time("weight_sync"):
-                        refit_policy_generation(
+                        refit_metrics = refit_policy_generation(
                             policy,
                             policy_generation,
                             colocated_inference,
@@ -4138,7 +4160,7 @@ def async_grpo_train(
                     trajectory_collector.pause.remote()
 
                     if NEED_REFIT and POLICY_GENERATION_STALE:
-                        refit_policy_generation(
+                        refit_metrics = refit_policy_generation(
                             policy, policy_generation, colocated_inference
                         )
                         POLICY_GENERATION_STALE = False
@@ -4419,6 +4441,8 @@ def async_grpo_train(
                 train_results, metrics, timing_metrics, master_config
             )
 
+            if refit_metrics:
+                logger.log_metrics(refit_metrics, step + 1, prefix="refit")
             logger.log_metrics(performance_metrics, step + 1, prefix="performance")
             logger.log_metrics(metrics, step + 1, prefix="train")
             # step_finished=True here since this is the final log of our current step.
