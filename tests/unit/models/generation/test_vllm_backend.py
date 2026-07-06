@@ -26,6 +26,8 @@ import pytest
 import torch
 from safetensors.torch import save_file
 
+from nemo_rl.utils.weight_transfer_sparse_codec import encode_sparse_infos
+
 
 def _write_sharded_checkpoint(model_dir, shards):
     """Write safetensors shards plus a model.safetensors.index.json.
@@ -334,22 +336,17 @@ def test_sparse_delta_sample_verification_only_compares_applied_delta(
     }
     ext._direct_sparse_delta_verification = None
     ext._direct_sparse_delta_verification_candidates = 0
-    metadata = [
-        {
-            "name": "weight",
-            "shape": (4,),
-            "index_encoding": "range",
-            "range_start": 1,
-            "value_start": 0,
-            "value_end": 2,
-            "verification_locations": [1, 3],
-            "verification_deltas": [expected_delta, expected_delta],
-        }
-    ]
-
-    ext._apply_sparse_weight_deltas(
-        (torch.empty(0, dtype=torch.uint8), torch.tensor([4.0, 4.0])), metadata
+    payload = encode_sparse_infos(
+        [("weight", target, torch.tensor([1, 3]), torch.tensor([4.0, 4.0]))],
+        empty_dtype=target.dtype,
     )
+    metadata = payload[2]
+    metadata[0].update(
+        verification_locations=[1, 3],
+        verification_deltas=[expected_delta, expected_delta],
+    )
+
+    ext._apply_sparse_weight_deltas(payload[:2], metadata)
     result = ext.finish_sparse_delta_refit()
 
     assert torch.equal(target, torch.tensor([1.0, initial + 4.0, 3.0, initial + 4.0]))
