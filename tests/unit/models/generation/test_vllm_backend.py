@@ -16,7 +16,9 @@
 # inside the test bodies (which are marked @pytest.mark.vllm). This keeps the
 # module collectable in the non-vllm unit lane, where these tests are deselected.
 
+import builtins
 import contextlib
+import importlib
 import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -24,6 +26,28 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 import torch
 from safetensors.torch import save_file
+
+
+@pytest.mark.vllm
+def test_async_worker_defers_web_server_imports(monkeypatch):
+    """Importing the worker must not directly load its HTTP dependencies."""
+    module = importlib.import_module("nemo_rl.models.generation.vllm.vllm_worker_async")
+    real_import = builtins.__import__
+    direct_web_imports = []
+
+    def track_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if (
+            globals is not None
+            and globals.get("__file__") == module.__file__
+            and name.partition(".")[0] in {"fastapi", "uvicorn"}
+        ):
+            direct_web_imports.append(name)
+        return real_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", track_import)
+    importlib.reload(module)
+
+    assert direct_web_imports == []
 
 
 def _make_collective_update_extension(backend):
